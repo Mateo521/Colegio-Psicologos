@@ -22,11 +22,11 @@ class IngestKnowledge extends Command
     public function handle()
     {
         $url = $this->argument('url');
-        $this->info("🕷️ Iniciando crawler en: $url");
+        $this->info("Iniciando el crawler en: $url");
         
-        if ($this->confirm('¿Quieres borrar la memoria actual del bot antes de empezar?', true)) {
+        if ($this->confirm('¿Queres borrar la memoria actual..?master', true)) {
             KnowledgeNode::truncate();
-            $this->info("🗑️ Memoria borrada.");
+            $this->info(" Memoria borrada.");
         }
 
         Crawler::create()
@@ -61,7 +61,7 @@ class IngestKnowledge extends Command
 
                         if (strlen($content) < 100) return; 
 
-                        $this->command->info("📄 Procesando: " . $url);
+                        $this->command->info(" Procesando: " . $url);
 
                         $chunks = str_split($content, 800); 
 
@@ -81,12 +81,12 @@ class IngestKnowledge extends Command
                                     'embedding' => json_encode($vector)
                                 ]);
 
-                                // --- CORRECCIÓN AQUÍ ---
-                                // Usamos getOutput() en lugar de acceder a la propiedad protegida
+                              
+                              
                                 $this->command->getOutput()->write('.'); 
 
                             } catch (\Exception $e) {
-                                // Usamos error() que es público, así que esto sí funciona
+                              
                                 $this->command->error("X");
                             }
                         }
@@ -111,6 +111,6 @@ class IngestKnowledge extends Command
             ->setTotalCrawlLimit(10)
             ->startCrawling($url);
 
-        $this->info("\n✅ Ingesta completada.");
+        $this->info("\nIngesta completada.");
     }
 }

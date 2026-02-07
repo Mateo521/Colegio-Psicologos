@@ -11,7 +11,7 @@ use OpenAI;
 
 class WhatsAppController extends Controller
 {
-    // Verificar el Webhook (Paso obligatorio de Meta)
+    
     public function verify(Request $request)
     {
         if ($request->hub_mode === 'subscribe' && 
@@ -23,8 +23,7 @@ class WhatsAppController extends Controller
 
     public function handle(Request $request)
 {
-    // PASO 0
-    Log::info('--- INICIO DE PROCESO ---');
+  
 
     try {
         $data = $request->all();
@@ -36,9 +35,8 @@ class WhatsAppController extends Controller
         $from = $message['from']; 
         $text = $message['text']['body'] ?? '';
 
-        Log::info("1. Mensaje extraído: $text");
-
-        // GESTIÓN DB
+    
+        
         $chat = Conversation::firstOrCreate(
             ['whatsapp_id' => $from],
             [
@@ -47,53 +45,43 @@ class WhatsAppController extends Controller
             ]
         );
         
-        Log::info("2. Usuario en Base de Datos OK. ID: " . $chat->id);
-
+ 
         if (!$chat->bot_active) {
-            Log::info("3. Bot pausado. Fin.");
+           
             return response('Bot Paused');
         }
 
-        // VERIFICAR API KEY
+        
         $apiKey = env('OPENAI_API_KEY');
         if (empty($apiKey)) {
             Log::error("CRÍTICO: No se encontró la OPENAI_API_KEY en el .env");
             return response('Error Config');
         }
-        Log::info("3. API Key detectada (comienza con: " . substr($apiKey, 0, 5) . "...)");
-
-        // OPENAI EMBEDDINGS
-        Log::info("4. Enviando a OpenAI Embeddings...");
+     
+      
         $vectorSearch = $this->getEmbedding($text);
-        Log::info("5. Embedding recibido OK.");
-
-        // BÚSQUEDA DB
-        Log::info("6. Buscando en Postgres...");
+       
         $contextNodes = KnowledgeNode::query()
                 ->selectRaw("content, url, 1 - (embedding <=> '$vectorSearch') as similarity")
                 ->orderByRaw("embedding <=> '$vectorSearch'")
-                ->limit(3) // Tomamos los 3 fragmentos más relevantes
+                ->limit(3)  
                 ->get();
 
-            // CAMBIO CLAVE: Formateamos texto + URL
+           
             $contextText = $contextNodes->map(function ($node) {
                 return "Fuente: {$node->url}\nInformación: {$node->content}";
             })->implode("\n\n---\n\n");
 
-        // OPENAI CHAT
-        Log::info("8. Enviando a GPT-4o-mini...");
+     
         $response = $this->askOpenAI($text, $contextText);
-        Log::info("9. Respuesta generada: " . substr($response, 0, 50) . "...");
-
-        // WHATSAPP
-        Log::info("10. Enviando respuesta a WhatsApp...");
+       
         $this->sendWhatsApp($from, $response);
-        Log::info("--- FIN EXITOSO ---");
+       
 
         return response('EVENT_RECEIVED');
 
     } catch (\Throwable $e) {
-        Log::error("❌ ERROR EN EL PROCESO: " . $e->getMessage());
+        Log::error(" : " . $e->getMessage());
         Log::error("Línea: " . $e->getLine());
         Log::error("Archivo: " . $e->getFile());
         return response('ERROR', 200);
@@ -147,7 +135,7 @@ class WhatsAppController extends Controller
                 ['role' => 'system', 'content' => $systemPrompt],
                 ['role' => 'user', 'content' => $question],
             ],
-            'temperature' => 0.2, // Temperatura baja = Más serio y fiel a los datos
+            'temperature' => 0.2,  
         ]);
         
         return $result->choices[0]->message->content;
@@ -155,13 +143,10 @@ class WhatsAppController extends Controller
 
     private function sendWhatsApp($to, $messageBody)
     {
-        // --- PARCHE PARA ARGENTINA (Corrección del error 131030) ---
-        // El webhook trae el 9 (ej: 549266...), pero tu lista de permitidos
-        // parece esperar el formato sin 9 (ej: 54266...)
+ 
         if (str_starts_with($to, '549')) {
             $to = '54' . substr($to, 3);
         }
-        // -----------------------------------------------------------
 
         $response = Http::withHeaders([
             'Authorization' => 'Bearer ' . env('WHATSAPP_TOKEN'),
@@ -174,9 +159,9 @@ class WhatsAppController extends Controller
         ]);
 
         if ($response->successful()) {
-            Log::info("✅ Enviado a WhatsApp correctamente a $to. ID: " . $response->json('messages.0.id'));
+            Log::info("Enviado a WhatsApp correctamente a $to. ID: " . $response->json('messages.0.id'));
         } else {
-            Log::error("❌ Meta rechazó el mensaje a $to. Razón: " . $response->body());
+            Log::error("Meta rechazó el mensaje a $to. Razón: " . $response->body());
         }
     }
 }

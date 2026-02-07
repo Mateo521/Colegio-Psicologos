@@ -3,61 +3,114 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
-use App\Models\KnowledgeNode;
-use OpenAI\Laravel\Facades\OpenAI; // Asegúrate de configurar el Facade o usar Client directo
 use Spatie\Crawler\Crawler;
+use Spatie\Crawler\CrawlProfiles\CrawlInternalUrls;
 use Spatie\Crawler\CrawlObservers\CrawlObserver;
 use Psr\Http\Message\UriInterface;
 use Psr\Http\Message\ResponseInterface;
+use GuzzleHttp\Exception\RequestException; 
+use Symfony\Component\DomCrawler\Crawler as DomCrawler;
+use App\Models\KnowledgeNode;
+use Illuminate\Support\Facades\Log;
+use OpenAI\Laravel\Facades\OpenAI; 
 
 class IngestKnowledge extends Command
 {
     protected $signature = 'knowledge:ingest {url}';
-    protected $description = 'Indexar sitio web a base vectorial';
+    protected $description = 'Scrapea una web y vectoriza su contenido para el bot';
 
     public function handle()
     {
         $url = $this->argument('url');
-        $this->info("Rastreando $url...");
+        $this->info("🕷️ Iniciando crawler en: $url");
+        
+        if ($this->confirm('¿Quieres borrar la memoria actual del bot antes de empezar?', true)) {
+            KnowledgeNode::truncate();
+            $this->info("🗑️ Memoria borrada.");
+        }
 
         Crawler::create()
-            ->setCrawlObserver(new class extends CrawlObserver {
-                public function crawled(UriInterface $url, ResponseInterface $response, ?UriInterface $foundOnUrl = null): void 
+            ->setCrawlObserver(new class($this) extends CrawlObserver {
+                private $command;
+
+                public function __construct($command) {
+                    $this->command = $command;
+                }
+
+                public function crawled(
+                    UriInterface $url, 
+                    ResponseInterface $response, 
+                    ?UriInterface $foundOnUrl = null, 
+                    ?string $linkText = null
+                ): void
                 {
-                    // 1. Limpieza básica del HTML
+                    if ($response->getStatusCode() !== 200) return;
+
+                    $contentType = $response->getHeaderLine('Content-Type');
+                    if (!str_contains($contentType, 'text/html')) return;
+
                     $html = (string) $response->getBody();
-                    $text = strip_tags($html); 
-                    // (Aquí deberías añadir una limpieza mejor para quitar menús/footers)
                     
-                    // 2. Chunking (dividir en trozos de 800 caracteres)
-                    $chunks = str_split($text, 800);
+                    try {
+                        $dom = new DomCrawler($html);
+                        if ($dom->filter('body')->count() === 0) return;
 
-                    $client = \OpenAI::client(env('OPENAI_API_KEY'));
+                        $content = $dom->filter('body')->text();
+                        $content = preg_replace('/\s+/', ' ', $content);
+                        $content = trim($content);
 
-                    foreach ($chunks as $chunk) {
-                        if(strlen($chunk) < 100) continue; // Ignorar trozos muy cortos
+                        if (strlen($content) < 100) return; 
 
-                        // 3. Crear Embedding
-                        $response = $client->embeddings()->create([
-                            'model' => 'text-embedding-3-small',
-                            'input' => $chunk,
-                        ]);
+                        $this->command->info("📄 Procesando: " . $url);
 
-                        $vector = $response->embeddings[0]->embedding;
+                        $chunks = str_split($content, 800); 
 
-                        // 4. Guardar en DB
-                        KnowledgeNode::create([
-                            'content' => $chunk,
-                            'url' => (string) $url,
-                            'embedding' => $vector
-                        ]);
-                        echo "."; // Feedback visual
+                        foreach ($chunks as $chunk) {
+                            try {
+                                $client = \OpenAI::client(env('OPENAI_API_KEY'));
+                                $response = $client->embeddings()->create([
+                                    'model' => 'text-embedding-3-small',
+                                    'input' => $chunk,
+                                ]);
+                                
+                                $vector = $response->embeddings[0]->embedding;
+
+                                KnowledgeNode::create([
+                                    'content' => $chunk,
+                                    'url' => (string) $url,
+                                    'embedding' => json_encode($vector)
+                                ]);
+
+                                // --- CORRECCIÓN AQUÍ ---
+                                // Usamos getOutput() en lugar de acceder a la propiedad protegida
+                                $this->command->getOutput()->write('.'); 
+
+                            } catch (\Exception $e) {
+                                // Usamos error() que es público, así que esto sí funciona
+                                $this->command->error("X");
+                            }
+                        }
+                        $this->command->newLine();
+
+                    } catch (\Exception $e) {
+                        $this->command->error("Error procesando HTML: " . $e->getMessage());
                     }
                 }
-                public function crawlFailed(UriInterface $url, $requestException, ?UriInterface $foundOnUrl = null): void {}
+
+                public function crawlFailed(
+                    UriInterface $url, 
+                    RequestException $requestException, 
+                    ?UriInterface $foundOnUrl = null, 
+                    ?string $linkText = null
+                ): void
+                {
+                    $this->command->error("Falló al visitar: " . $url . " - Error: " . $requestException->getMessage());
+                }
             })
-            ->startCrawl($url);
-            
-        $this->info("\n¡Ingesta completada!");
+            ->setCrawlProfile(new CrawlInternalUrls($url)) 
+            ->setTotalCrawlLimit(10)
+            ->startCrawling($url);
+
+        $this->info("\n✅ Ingesta completada.");
     }
 }

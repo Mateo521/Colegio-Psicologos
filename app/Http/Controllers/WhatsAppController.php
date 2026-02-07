@@ -21,94 +21,157 @@ class WhatsAppController extends Controller
         return response('Error de token', 403);
     }
 
-    // Recibir mensajes
     public function handle(Request $request)
-    {
+{
+    // PASO 0
+    Log::info('--- INICIO DE PROCESO ---');
 
-
+    try {
         $data = $request->all();
-        
-        // Validar que sea un mensaje de texto
         $entry = $data['entry'][0]['changes'][0]['value'] ?? null;
+        
         if (!isset($entry['messages'][0])) return response('OK');
 
         $message = $entry['messages'][0];
-        $phoneId = $entry['metadata']['phone_number_id'];
-        $from = $message['from']; // El número del cliente
+        $from = $message['from']; 
         $text = $message['text']['body'] ?? '';
 
-        // 1. Obtener o crear conversación
+        Log::info("1. Mensaje extraído: $text");
+
+        // GESTIÓN DB
         $chat = Conversation::firstOrCreate(
             ['whatsapp_id' => $from],
-            ['bot_active' => true]
+            [
+                'bot_active' => true,
+                'last_message_at' => now() 
+            ]
         );
-
-        // 2. Lógica de "Human Handoff"
-        // Si el cliente pide hablar con humano explícitamente
-        if (str_contains(strtolower($text), 'asesor') || str_contains(strtolower($text), 'humano')) {
-            $chat->update(['bot_active' => false]);
-            $this->sendWhatsApp($from, "Entendido. Un asesor humano te contactará pronto. (IA Desactivada)");
-            // Aquí enviarías un email o notificación a tu cliente real
-            return response('Handoff triggered');
-        }
-
-        // Si el bot está apagado, NO responder
-        if (!$chat->bot_active) {
-            return response('Bot is sleeping');
-        }
-
-        // 3. RAG: Buscar información relevante
-        $vectorSearch = $this->getEmbedding($text);
         
-        // Búsqueda de similitud de cosenos en Postgres
+        Log::info("2. Usuario en Base de Datos OK. ID: " . $chat->id);
+
+        if (!$chat->bot_active) {
+            Log::info("3. Bot pausado. Fin.");
+            return response('Bot Paused');
+        }
+
+        // VERIFICAR API KEY
+        $apiKey = env('OPENAI_API_KEY');
+        if (empty($apiKey)) {
+            Log::error("CRÍTICO: No se encontró la OPENAI_API_KEY en el .env");
+            return response('Error Config');
+        }
+        Log::info("3. API Key detectada (comienza con: " . substr($apiKey, 0, 5) . "...)");
+
+        // OPENAI EMBEDDINGS
+        Log::info("4. Enviando a OpenAI Embeddings...");
+        $vectorSearch = $this->getEmbedding($text);
+        Log::info("5. Embedding recibido OK.");
+
+        // BÚSQUEDA DB
+        Log::info("6. Buscando en Postgres...");
         $contextNodes = KnowledgeNode::query()
-            ->selectRaw("content, 1 - (embedding <=> '$vectorSearch') as similarity")
-            ->orderByRaw("embedding <=> '$vectorSearch'")
-            ->limit(3)
-            ->get();
+                ->selectRaw("content, url, 1 - (embedding <=> '$vectorSearch') as similarity")
+                ->orderByRaw("embedding <=> '$vectorSearch'")
+                ->limit(3) // Tomamos los 3 fragmentos más relevantes
+                ->get();
 
-        $contextText = $contextNodes->pluck('content')->implode("\n---\n");
+            // CAMBIO CLAVE: Formateamos texto + URL
+            $contextText = $contextNodes->map(function ($node) {
+                return "Fuente: {$node->url}\nInformación: {$node->content}";
+            })->implode("\n\n---\n\n");
 
-        // 4. Generar Respuesta con GPT-4o
+        // OPENAI CHAT
+        Log::info("8. Enviando a GPT-4o-mini...");
         $response = $this->askOpenAI($text, $contextText);
+        Log::info("9. Respuesta generada: " . substr($response, 0, 50) . "...");
 
-        // 5. Enviar respuesta a WhatsApp
+        // WHATSAPP
+        Log::info("10. Enviando respuesta a WhatsApp...");
         $this->sendWhatsApp($from, $response);
+        Log::info("--- FIN EXITOSO ---");
 
         return response('EVENT_RECEIVED');
+
+    } catch (\Throwable $e) {
+        Log::error("❌ ERROR EN EL PROCESO: " . $e->getMessage());
+        Log::error("Línea: " . $e->getLine());
+        Log::error("Archivo: " . $e->getFile());
+        return response('ERROR', 200);
     }
+}
 
     private function getEmbedding($text)
     {
         $client = \OpenAI::client(env('OPENAI_API_KEY'));
+        
         $response = $client->embeddings()->create([
-            'model' => 'text-embedding-3-small',
+             
+            'model' => 'text-embedding-3-small', 
+            
             'input' => $text,
         ]);
+        
         return json_encode($response->embeddings[0]->embedding);
     }
 
     private function askOpenAI($question, $context)
     {
         $client = \OpenAI::client(env('OPENAI_API_KEY'));
+        
+        $systemPrompt = "
+            Actúa como el Asistente Virtual oficial del Colegio de Psicólogos de San Luis.
+            
+            DIRECTRICES DE COMPORTAMIENTO:
+            1. Tono: Formal, institucional y empático (trato de 'Usted').
+            2. Objetivo: Responder consultas basándose en la información oficial.
+            
+            REGLAS ESTRICTAS DE RESPUESTA:
+            - CASO 1 (SALUDOS): Si el usuario saluda (ej: 'Hola', 'Buenos días') o pregunta quién eres, preséntate brevemente y ofrece ayuda, SIN necesitar buscar en el contexto.
+            - CASO 2 (CONSULTAS TÉCNICAS): Para preguntas sobre trámites, costos o reglamentos, basa tu respuesta EXCLUSIVAMENTE en el 'CONTEXTO' de abajo.
+            
+            - Si encuentras la respuesta en el contexto, CITA LA FUENTE al final: 'Fuente: [URL]'.
+            - Si NO encuentras la respuesta, di: 'Disculpe, no dispongo de esa información oficial. Por favor contacte a la administración.'
+            
+            CONTEXTO DISPONIBLE:
+            $context
+        ";
+
         $result = $client->chat()->create([
-            'model' => 'gpt-4o-mini', // Modelo rápido y barato
+            'model' => 'gpt-4o-mini', 
             'messages' => [
-                ['role' => 'system', 'content' => "Eres un asistente útil. Responde usando SOLO esta información:\n" . $context],
+                ['role' => 'system', 'content' => $systemPrompt],
                 ['role' => 'user', 'content' => $question],
             ],
+            'temperature' => 0.2, // Temperatura baja = Más serio y fiel a los datos
         ]);
+        
         return $result->choices[0]->message->content;
     }
 
-    private function sendWhatsApp($to, $message)
+    private function sendWhatsApp($to, $messageBody)
     {
-        Http::withToken(env('WHATSAPP_TOKEN'))
-            ->post("https://graph.facebook.com/v18.0/".env('WHATSAPP_PHONE_ID')."/messages", [
-                'messaging_product' => 'whatsapp',
-                'to' => $to,
-                'type' => 'text',
-                'text' => ['body' => $message]
-            ]);
+        // --- PARCHE PARA ARGENTINA (Corrección del error 131030) ---
+        // El webhook trae el 9 (ej: 549266...), pero tu lista de permitidos
+        // parece esperar el formato sin 9 (ej: 54266...)
+        if (str_starts_with($to, '549')) {
+            $to = '54' . substr($to, 3);
+        }
+        // -----------------------------------------------------------
+
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . env('WHATSAPP_TOKEN'),
+            'Content-Type'  => 'application/json',
+        ])->post("https://graph.facebook.com/v21.0/".env('WHATSAPP_PHONE_ID')."/messages", [
+            'messaging_product' => 'whatsapp',
+            'to'   => $to,
+            'type' => 'text',
+            'text' => ['body' => $messageBody]
+        ]);
+
+        if ($response->successful()) {
+            Log::info("✅ Enviado a WhatsApp correctamente a $to. ID: " . $response->json('messages.0.id'));
+        } else {
+            Log::error("❌ Meta rechazó el mensaje a $to. Razón: " . $response->body());
+        }
     }
 }
